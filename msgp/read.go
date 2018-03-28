@@ -146,6 +146,56 @@ func (m *Reader) Read(p []byte) (int, error) {
 	return m.R.Read(p)
 }
 
+// CopyNext reads the next object from m without decoding it and writes it to w.
+// It avoids unnecessary copies internally.
+func (m *Reader) CopyNext(w io.Writer) (int64, error) {
+	sz, o, err := getNextSize(m.R)
+	if err != nil {
+		return 0, err
+	}
+
+	var n int64
+	// Opportunistic optimization: if we can fit the whole thing in the m.R
+	// buffer, then just get a pointer to that, and pass it to w.Write,
+	// avoiding an allocation.
+	if int(sz) <= m.R.BufferSize() {
+		var nn int
+		var buf []byte
+		buf, err = m.R.Next(int(sz))
+		if err != nil {
+			if err == io.ErrUnexpectedEOF {
+				err = ErrShortBytes
+			}
+			return 0, err
+		}
+		nn, err = w.Write(buf)
+		n += int64(nn)
+	} else {
+		// Fall back to io.CopyN.
+		// May avoid allocating if w is a ReaderFrom (e.g. bytes.Buffer)
+		n, err = io.CopyN(w, m.R, int64(sz))
+		if err == io.ErrUnexpectedEOF {
+			err = ErrShortBytes
+		}
+	}
+	if err != nil {
+		return n, err
+	} else if n < int64(sz) {
+		return n, io.ErrShortWrite
+	}
+
+	// for maps and slices, read elements
+	for x := uintptr(0); x < o; x++ {
+		var n2 int64
+		n2, err = m.CopyNext(w)
+		if err != nil {
+			return n, err
+		}
+		n += n2
+	}
+	return n, nil
+}
+
 // ReadFull implements `io.ReadFull`
 func (m *Reader) ReadFull(p []byte) (int, error) {
 	return m.R.ReadFull(p)
@@ -194,8 +244,10 @@ func (m *Reader) IsNil() bool {
 	return err == nil && p[0] == mnil
 }
 
+// getNextSize returns the size of the next object on the wire.
 // returns (obj size, obj elements, error)
 // only maps and arrays have non-zero obj elements
+// for maps and arrays, obj size does not include elements
 //
 // use uintptr b/c it's guaranteed to be large enough
 // to hold whatever we can fit in memory.
@@ -1087,6 +1139,33 @@ func (m *Reader) ReadMapStrIntf(mp map[string]interface{}) (err error) {
 	return
 }
 
+// ReadMapIntfIntf reads a MessagePack map into a map[interface{}]interface{}.
+// (You must pass a non-nil map into the function.)
+func (m *Reader) ReadMapIntfIntf(mp map[interface{}]interface{}) (err error) {
+	var sz uint32
+	sz, err = m.ReadMapHeader()
+	if err != nil {
+		return
+	}
+	for key := range mp {
+		delete(mp, key)
+	}
+	for i := uint32(0); i < sz; i++ {
+		var key interface{}
+		var val interface{}
+		key, err = m.ReadIntf()
+		if err != nil {
+			return
+		}
+		val, err = m.ReadIntf()
+		if err != nil {
+			return
+		}
+		mp[key] = val
+	}
+	return
+}
+
 // ReadTime reads a time.Time object from the reader.
 // The returned time's location will be set to time.Local.
 func (m *Reader) ReadTime() (t time.Time, err error) {
@@ -1111,7 +1190,7 @@ func (m *Reader) ReadTime() (t time.Time, err error) {
 
 // ReadIntf reads out the next object as a raw interface{}.
 // Arrays are decoded as []interface{}, and maps are decoded
-// as map[string]interface{}. Integers are decoded as int64
+// as map[interface{}]interface{}. Integers are decoded as int64
 // and unsigned integers are decoded as uint64.
 func (m *Reader) ReadIntf() (i interface{}, err error) {
 	var t Type
@@ -1172,8 +1251,8 @@ func (m *Reader) ReadIntf() (i interface{}, err error) {
 		return
 
 	case MapType:
-		mp := make(map[string]interface{})
-		err = m.ReadMapStrIntf(mp)
+		mp := make(map[interface{}]interface{})
+		err = m.ReadMapIntfIntf(mp)
 		i = mp
 		return
 
